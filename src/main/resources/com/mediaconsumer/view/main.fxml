@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<?import javafx.geometry.Insets?>
+<?import javafx.scene.control.*?>
+<?import javafx.scene.layout.*?>
+
+<BorderPane xmlns="http://javafx.com/javafx/17" xmlns:fx="http://javafx.com/fxml/1"
+            fx:controller="com.mediaconsumer.controller.MainController">
+    <top>
+        <ToolBar>
+            <Label text="Media Consumer"/>
+            <Separator/>
+            <Label fx:id="queueStatusLabel" text="Queue: 0/0"/>
+        </ToolBar>
+    </top>
+    <center>
+        <ScrollPane fx:id="scrollPane">
+            <TilePane fx:id="videoTilePane" prefColumns="3" hgap="10" vgap="10">
+                <padding>
+                    <Insets top="10" right="10" bottom="10" left="10"/>
+                </padding>
+            </TilePane>
+        </ScrollPane>
+    </center>
+</BorderPane>

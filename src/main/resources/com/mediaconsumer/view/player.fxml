@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<?import javafx.scene.control.*?>
+<?import javafx.scene.layout.*?>
+<?import javafx.scene.media.*?>
+
+<VBox xmlns="http://javafx.com/javafx/17" xmlns:fx="http://javafx.com/fxml/1" fx:id="playerRoot" spacing="10">
+    <MediaView fx:id="mediaView" fitWidth="800" fitHeight="450"/>
+    <HBox spacing="10" alignment="CENTER">
+        <Button fx:id="playButton" text="Play"/>
+        <Button fx:id="pauseButton" text="Pause"/>
+        <Button fx:id="stopButton" text="Stop"/>
+    </HBox>
+</VBox>
