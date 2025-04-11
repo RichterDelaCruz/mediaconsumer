@@ -34,6 +34,11 @@ import java.util.Objects;
 public class MainController {
     private static final Logger logger = LoggerFactory.getLogger(MainController.class); // Use logger
 
+    // --- REMOVED TEMPORARY TEST DELAY ---
+    // private static final long QUEUE_CONSUME_DELAY_MS = 1000; // Delay was here
+    // --- END REMOVED TEMPORARY TEST DELAY ---
+    private static final long QUEUE_CONSUME_DELAY_MS = 30000; // e.g., 10 second delay
+
     @FXML private ScrollPane scrollPane;
     @FXML private TilePane videoTilePane;
     @FXML private Label queueStatusLabel;
@@ -47,11 +52,14 @@ public class MainController {
 
     public void initialize() { // Use initialize for loading resources tied to FXML
         try {
+            // Use Objects.requireNonNull to make null resource immediately obvious
             placeholderImage = new Image(Objects.requireNonNull(getClass().getResourceAsStream("/placeholder.png")));
             if (placeholderImage.isError()) {
                 logger.error("Failed to load placeholder image!", placeholderImage.getException());
                 // Maybe create a default colored rectangle?
             }
+        } catch (NullPointerException npe) {
+            logger.error("Error loading placeholder image: placeholder.png not found in resources!", npe);
         } catch (Exception e) {
             logger.error("Error loading placeholder image", e);
             // Handle error appropriately, maybe disable UI elements
@@ -73,17 +81,41 @@ public class MainController {
         // Consider using JavaFX Service/Task for better lifecycle management
         Thread queueMonitorThread = new Thread(() -> {
             logger.info("Queue monitor thread started.");
+            // --- Add log message if delay is active ---
+            if (QUEUE_CONSUME_DELAY_MS > 0) {
+                logger.warn("!!! ARTIFICIAL QUEUE CONSUME DELAY ACTIVE: {} ms !!!", QUEUE_CONSUME_DELAY_MS);
+            }
+            // --- End log message ---
+
             while (!Thread.currentThread().isInterrupted()) {
                 try {
-                    VideoFile video = videoQueue.take(); // Blocks until item available
+                    VideoFile video = videoQueue.take(); // 1. Take item from queue
                     logger.debug("Took video from queue: {}", video.getFile().getName());
-                    // Update UI on the JavaFX Application Thread
+
+                    // --- START OF ADDED DELAY BLOCK ---
+                    // Add a sleep *after* taking from the queue to simulate slower UI consumption
+                    if (QUEUE_CONSUME_DELAY_MS > 0) {
+                        try {
+                            logger.debug("ARTIFICIAL DELAY STARTING for {} ({}ms)", video.getFile().getName(), QUEUE_CONSUME_DELAY_MS);
+                            Thread.sleep(QUEUE_CONSUME_DELAY_MS); // <<< THE ACTUAL SLEEP
+                            logger.debug("ARTIFICIAL DELAY ENDING for {}", video.getFile().getName());
+                        } catch (InterruptedException sleepEx) {
+                            logger.info("Queue monitor sleep interrupted.");
+                            Thread.currentThread().interrupt(); // Re-set interrupt status
+                            break; // Exit loop if sleep is interrupted
+                        }
+                    }
+                    // --- END OF ADDED DELAY BLOCK ---
+
+
+                    // 3. Schedule UI update (only happens AFTER the delay)
                     Platform.runLater(() -> {
                         addVideoToUI(video);
                         updateQueueStatus(); // Update status after adding UI element
                     });
+
                 } catch (InterruptedException e) {
-                    logger.info("Queue monitor thread interrupted normally.");
+                    logger.info("Queue monitor thread interrupted normally (during take).");
                     Thread.currentThread().interrupt(); // Re-interrupt thread status
                     break; // Exit loop
                 } catch (Exception e) {
@@ -98,6 +130,9 @@ public class MainController {
         queueMonitorThread.setDaemon(true); // Allow application to exit even if thread is blocked
         queueMonitorThread.start();
     }
+
+    // ... rest of the MainController.java file remains the same ...
+    // (addVideoToUI, loadThumbnailAsync, setupHoverPreview, setupClickToPlay, etc.)
 
     private void addVideoToUI(VideoFile video) {
         if (video == null) {

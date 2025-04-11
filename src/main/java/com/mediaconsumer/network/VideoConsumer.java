@@ -10,13 +10,12 @@ import org.slf4j.LoggerFactory;
 
 import java.io.*;
 import java.net.Socket;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.Paths;
-import java.nio.file.StandardCopyOption;
+import java.nio.file.*; // Import FileAlreadyExistsException, Paths, StandardCopyOption
+import java.nio.file.attribute.FileAttribute;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
-import java.util.stream.Stream; // Keep Stream import
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap; // Import ConcurrentHashMap
 
 public class VideoConsumer implements Runnable {
     private static final Logger logger = LoggerFactory.getLogger(VideoConsumer.class);
@@ -34,6 +33,8 @@ public class VideoConsumer implements Runnable {
     private static final String STATUS_TRANSFER_ERROR = "TRANSFER_ERROR";
     private static final String STATUS_INTERNAL_ERROR = "INTERNAL_ERROR";
 
+    // --- Static map to hold locks for specific file content hashes ---
+    private static final ConcurrentHashMap<String, Object> hashLocks = new ConcurrentHashMap<>();
 
     public VideoConsumer(Socket clientSocket, VideoQueue videoQueue) {
         this.clientSocket = clientSocket;
@@ -42,146 +43,194 @@ public class VideoConsumer implements Runnable {
 
     @Override
     public void run() {
-        Path tempPath = null; // Keep track of the primary temp file for cleanup
-        String clientIp = clientSocket.getInetAddress().getHostAddress(); // Get client IP for logging
-        String originalFileName = "unknown"; // Store original filename for logging
+        Path uniqueTempPath = null;
+        Path originalTempPathUsedForCompression = null;
+        String clientIp = clientSocket.getInetAddress().getHostAddress();
+        String originalFileName = "unknown";
+        String fileHash = null;
+        Path finalPath = null;
+        String finalName = "unknown_final";
+        boolean successfullyQueued = false; // Flag to track outcome for finally block
 
         try (DataInputStream dis = new DataInputStream(clientSocket.getInputStream());
              DataOutputStream dos = new DataOutputStream(clientSocket.getOutputStream())) {
 
             // 1. Read file metadata & Sanitize Filename
-            originalFileName = dis.readUTF(); // Store original name
+            originalFileName = dis.readUTF();
             String sanitizedFileName = sanitizeFileName(originalFileName);
             long fileSize = dis.readLong();
-            logger.info("Connection from {}: Received metadata: OriginalName='{}', SanitizedName='{}', Size={}",
-                    clientIp, originalFileName, sanitizedFileName, fileSize);
+            logger.info("[{}] Received: '{}' -> '{}', Size={}", clientIp, originalFileName, sanitizedFileName, fileSize);
 
-
-            // 2. Check queue capacity BEFORE receiving file
+            // 2. Check queue capacity (Optional initial check)
+            // Note: isFull() should be synchronized in VideoQueue for this check to be reliable
             if (videoQueue.isFull()) {
                 sendResponse(dos, STATUS_QUEUE_FULL);
-                logger.warn("Queue full. Rejecting file '{}' from {}", sanitizedFileName, clientIp);
-                return; // Exit early
+                logger.warn("[{}] Queue full (initial check). Rejecting '{}'.", clientIp, sanitizedFileName);
+                return;
             }
 
-            // 3. Prepare upload directory and file paths
+            // 3. Prepare upload dir & UNIQUE temp file path
             Path uploadDir = Paths.get(UPLOAD_DIR);
-            Files.createDirectories(uploadDir); // Ensure directory exists
-
-            String timestamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss"));
-            String uniqueTempName = "TEMP_" + timestamp + "_" + sanitizedFileName;
-            String finalName = timestamp + "_" + sanitizedFileName;
-
-            tempPath = uploadDir.resolve(uniqueTempName); // Assign to tracked temp path
-            Path finalPath = uploadDir.resolve(finalName);
-
-
-            // 4. Receive file to temp location
-            logger.debug("Receiving file to temporary path: {}", tempPath);
-            FileUtils.receiveFile(dis, tempPath, fileSize);
-            logger.info("File received to temp location: {}. Size: {} bytes", tempPath, Files.size(tempPath));
-
-            // 5. Verify received file size
-            if (Files.size(tempPath) != fileSize) {
-                // Don't need to explicitly delete, caught by general exception handler below
-                throw new IOException("File size mismatch after transfer for " + sanitizedFileName);
-            }
-
-            // 6. Calculate hash and check for duplicates
-            String fileHash = HashUtils.calculateSHA256(tempPath);
-            logger.debug("File hash calculated: {} for {}", fileHash, sanitizedFileName);
-
-            if (FileUtils.isDuplicate(fileHash, uploadDir, tempPath)) {
-                // Delete the received duplicate temp file
-                Files.deleteIfExists(tempPath);
-                sendResponse(dos, STATUS_DUPLICATE);
-                logger.warn("Duplicate file detected (Hash: {}) for '{}' from {}. Temp file deleted.", fileHash, sanitizedFileName, clientIp);
-                return; // Exit
-            }
-
-            Path currentPath = tempPath; // Path to the file we will potentially add to queue
-
-            // 7. Handle large files - Compression Step with Error Handling
-            if (fileSize > MAX_FILE_SIZE) {
-                logger.info("File '{}' ({} bytes) exceeds max size ({} bytes). Attempting compression.",
-                        sanitizedFileName, fileSize, MAX_FILE_SIZE);
-                Path compressedPath = null;
-                try {
-                    compressedPath = VideoUtils.compressVideo(tempPath);
-                    logger.info("Compression successful for '{}'. New path: {}", sanitizedFileName, compressedPath);
-                    // If successful, delete the original large temp file
-                    Files.delete(tempPath);
-                    tempPath = null; // Mark original temp path as deleted
-                    currentPath = compressedPath; // Update currentPath to the compressed one
-
-                } catch (IOException | RuntimeException compressionEx) { // Catch expected + unexpected errors
-                    logger.error("Compression failed for '{}' from {}: {}", sanitizedFileName, clientIp, compressionEx.getMessage());
-                    // If compression failed, the original tempPath still exists, compressedPath might not.
-                    // No need to delete original tempPath here, it will be cleaned up by outer catch/finally.
-                    // Make sure the incomplete compressed file is deleted (VideoUtils should handle this)
-                    sendResponse(dos, STATUS_COMPRESSION_FAILED);
-                    return; // Exit processing
-                }
-            }
-
-            // 8. Move to final location
-            logger.debug("Moving processed file from {} to {}", currentPath, finalPath);
-            Files.move(currentPath, finalPath, StandardCopyOption.REPLACE_EXISTING);
-            // After move, currentPath (temp or compressed) no longer exists.
-            tempPath = null; // Mark as moved/deleted
-            logger.info("File moved to final location: {}", finalPath);
-
-            // 9. Add to queue
-            VideoFile videoFile = new VideoFile(finalPath.toFile(), fileHash);
-            if (videoQueue.add(videoFile)) {
-                sendResponse(dos, STATUS_SUCCESS);
-                logger.info("File '{}' successfully processed and added to queue.", finalName);
-            } else {
-                // Should be rare if we check isFull() at the start, but handle defensively
-                Files.deleteIfExists(finalPath); // Delete the final file if queue is full now
-                sendResponse(dos, STATUS_QUEUE_FULL);
-                logger.warn("Queue became full after processing '{}'. Final file deleted.", finalName);
-            }
-
-        } catch (IOException e) {
-            // Handle errors during transfer, file ops, hashing etc.
-            logger.error("IOException during client request processing for '{}' from {}: {}", originalFileName, clientIp, e.getMessage(), e);
-            // Attempt to send transfer error status if possible
-            sendResponseSafe(clientSocket, STATUS_TRANSFER_ERROR);
-            // Cleanup the primary temp file if it exists
-            deleteFileIfExists(tempPath, "transfer error cleanup");
-
-        } catch (Exception e) {
-            // Catch unexpected errors (RuntimeExceptions etc.)
-            logger.error("Unexpected error processing client request for '{}' from {}: {}", originalFileName, clientIp, e.getMessage(), e);
-            // Attempt to send internal error status if possible
-            sendResponseSafe(clientSocket, STATUS_INTERNAL_ERROR);
-            // Cleanup the primary temp file if it exists
-            deleteFileIfExists(tempPath, "unexpected error cleanup");
-
-        } finally {
-            // Ensure socket is always closed
+            Files.createDirectories(uploadDir);
             try {
-                if (clientSocket != null && !clientSocket.isClosed()) {
-                    logger.debug("Closing client socket for {}", clientIp);
-                    clientSocket.close();
-                }
+                uniqueTempPath = Files.createTempFile(uploadDir, "vid-", ".tmp");
+                logger.debug("[{}] Created unique temp: {}", clientIp, uniqueTempPath.getFileName());
             } catch (IOException e) {
-                logger.warn("Error closing client socket for {}: {}", clientIp, e.getMessage());
+                logger.error("[{}] Failed to create temp file: {}", clientIp, e.getMessage());
+                sendResponse(dos, STATUS_INTERNAL_ERROR);
+                return;
             }
-            // Final check: cleanup temp file if something went wrong and it wasn't handled/moved
-            deleteFileIfExists(tempPath, "final cleanup");
-        }
-    }
 
+            // 4. Receive file
+            logger.debug("[{}] Receiving to: {}", clientIp, uniqueTempPath.getFileName());
+            FileUtils.receiveFile(dis, uniqueTempPath, fileSize);
+            logger.info("[{}] Received {} bytes to {}", clientIp, Files.size(uniqueTempPath), uniqueTempPath.getFileName());
+
+            // 5. Verify size
+            if (Files.size(uniqueTempPath) != fileSize) {
+                throw new IOException("Size mismatch for " + sanitizedFileName);
+            }
+
+            // 6. Calculate hash (needed for locking)
+            fileHash = HashUtils.calculateSHA256(uniqueTempPath);
+            logger.debug("[{}] Hash: {} for {}", clientIp, fileHash, sanitizedFileName);
+
+            // --- Synchronization Block based on Content Hash ---
+            Object hashLock = hashLocks.computeIfAbsent(fileHash, k -> new Object());
+
+            synchronized (hashLock) {
+                logger.debug("[{}] Acquired lock for hash {}", clientIp, fileHash);
+                // --- CRITICAL SECTION START ---
+                try {
+                    // 7. Check for Duplicates AGAIN (Inside Lock)
+                    if (FileUtils.isDuplicate(fileHash, uploadDir, uniqueTempPath)) {
+                        deleteFileIfExists(uniqueTempPath, "duplicate detected inside lock");
+                        sendResponse(dos, STATUS_DUPLICATE);
+                        logger.warn("[{}] Duplicate file confirmed (Hash: {}) INSIDE LOCK for '{}'. Temp deleted.", clientIp, fileHash, sanitizedFileName);
+                        uniqueTempPath = null;
+                        return; // Exit synchronized block and run method
+                    }
+
+                    // 8. Determine FINAL Filename (Timestamp + Unique Suffix)
+                    String timestamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd_HHmmssSSS"));
+                    String tempFileName = uniqueTempPath.getFileName().toString();
+                    String uniqueSuffix = "";
+                    int prefixEnd = tempFileName.indexOf('-');
+                    int suffixStart = tempFileName.lastIndexOf('.');
+                    if (prefixEnd != -1 && suffixStart != -1 && suffixStart > prefixEnd + 1) {
+                        uniqueSuffix = tempFileName.substring(prefixEnd + 1, suffixStart);
+                    } else {
+                        uniqueSuffix = UUID.randomUUID().toString().substring(0, 8);
+                        logger.warn("[{}] Could not parse unique suffix from temp file '{}', using UUID fallback.", clientIp, tempFileName);
+                    }
+                    finalName = String.format("%s_%s_%s", timestamp, uniqueSuffix, sanitizedFileName);
+                    finalPath = uploadDir.resolve(finalName);
+                    logger.debug("[{}] Determined final path INSIDE LOCK: {}", clientIp, finalPath.getFileName());
+
+                    Path currentPath = uniqueTempPath;
+
+                    // 9. Compression (if needed)
+                    if (fileSize > MAX_FILE_SIZE) {
+                        logger.info("[{}] File '{}' needs compression INSIDE LOCK.", clientIp, sanitizedFileName);
+                        originalTempPathUsedForCompression = uniqueTempPath;
+                        Path compressedPath = null;
+                        try {
+                            compressedPath = VideoUtils.compressVideo(originalTempPathUsedForCompression);
+                            logger.info("[{}] Compression successful INSIDE LOCK. New path: {}", clientIp, compressedPath.getFileName());
+                            deleteFileIfExists(originalTempPathUsedForCompression, "replaced by compressed version");
+                            uniqueTempPath = null; // Original temp is gone
+                            currentPath = compressedPath; // Work with compressed file
+                        } catch (IOException | RuntimeException compressionEx) {
+                            logger.error("[{}] Compression failed INSIDE LOCK for '{}': {}", clientIp, sanitizedFileName, compressionEx.getMessage());
+                            sendResponse(dos, STATUS_COMPRESSION_FAILED);
+                            // Keep uniqueTempPath for cleanup in outer finally
+                            return; // Exit synchronized block
+                        }
+                    }
+
+                    // 10. Move to final location
+                    logger.debug("[{}] Attempting to move {} to {} INSIDE LOCK", clientIp, currentPath.getFileName(), finalPath.getFileName());
+                    try {
+                        Files.move(currentPath, finalPath, StandardCopyOption.REPLACE_EXISTING);
+                        uniqueTempPath = null; // Source temp is gone
+                        originalTempPathUsedForCompression = null; // If compression happened, its source is gone too
+                        logger.info("[{}] File finalized INSIDE LOCK: {}", clientIp, finalPath.getFileName());
+                    } catch (IOException moveEx) {
+                        logger.error("[{}] Failed to move {} to {} INSIDE LOCK: {}", clientIp, currentPath.getFileName(), finalPath.getFileName(), moveEx.getMessage());
+                        sendResponse(dos, STATUS_INTERNAL_ERROR);
+                        // Keep 'currentPath' (uniqueTempPath or compressedPath) for cleanup in outer finally
+                        return; // Exit synchronized block
+                    }
+
+                    // 11. Add to queue
+                    VideoFile videoFile = new VideoFile(finalPath.toFile(), fileHash);
+                    // Check queue status *within the lock* before attempting add
+                    if (!videoQueue.isFull()) { // Use synchronized isFull
+                        if (videoQueue.add(videoFile)) { // Use synchronized add
+                            successfullyQueued = true; // Mark success for finally block
+                            sendResponse(dos, STATUS_SUCCESS);
+                            logger.info("[{}] File '{}' ADDED to queue successfully INSIDE LOCK.", clientIp, finalName);
+                            // Don't nullify finalPath here, let finally block know it was handled
+                        } else {
+                            // Should be rare now
+                            sendResponse(dos, STATUS_QUEUE_FULL);
+                            logger.error("[{}] Queue full when adding '{}' INSIDE LOCK despite check! Final file kept.", clientIp, finalName);
+                            // successfullyQueued remains false
+                        }
+                    } else {
+                        // Queue was full when checked.
+                        sendResponse(dos, STATUS_QUEUE_FULL);
+                        logger.warn("[{}] Queue full (checked inside lock) when adding '{}'. Final file kept.", clientIp, finalName);
+                        // successfullyQueued remains false
+                    }
+                    // --- CRITICAL SECTION END ---
+                } finally {
+                    logger.debug("[{}] Releasing lock for hash {}", clientIp, fileHash);
+                    // Optionally remove lock from map if not needed soon (complex)
+                }
+            } // --- End synchronization (hashLock) block ---
+
+            // --- Outer Exception Handling ---
+        } catch (IOException e) {
+            logger.error("[{}] IOException processing '{}': {}", clientIp, originalFileName, e.getMessage(), e);
+            sendResponseSafe(clientSocket, STATUS_TRANSFER_ERROR);
+            // Temp file might still exist
+        } catch (Exception e) {
+            logger.error("[{}] Unexpected error processing '{}': {}", clientIp, originalFileName, e.getMessage(), e);
+            sendResponseSafe(clientSocket, STATUS_INTERNAL_ERROR);
+            // Temp file might still exist
+        } finally {
+            // --- Cleanup ---
+            // Close socket
+            try {
+                if (clientSocket != null && !clientSocket.isClosed()) { clientSocket.close(); }
+            } catch (IOException e) { logger.warn("[{}] Error closing socket: {}", clientIp, e.getMessage()); }
+
+            // Delete any remaining temporary files created by THIS thread's execution.
+            // uniqueTempPath might exist if error occurred before move/compression delete
+            deleteFileIfExists(uniqueTempPath, "final cleanup (unique temp)");
+            // originalTempPathUsedForCompression might exist if compression failed after assignment
+            deleteFileIfExists(originalTempPathUsedForCompression, "final cleanup (original pre-comp)");
+
+            // Delete the FINAL file ONLY IF it was created (finalPath is not null)
+            // AND it was NOT successfully queued (successfullyQueued is false).
+            // This covers errors within the sync block after move, and QUEUE_FULL rejections.
+            if (!successfullyQueued && finalPath != null) {
+                logger.warn("[{}] Deleting final file '{}' because it was not successfully queued.", clientIp, finalPath.getFileName());
+                deleteFileIfExists(finalPath, "final cleanup (not queued)");
+            }
+        }
+    } // --- End run() method ---
+
+    // ... (sendResponse, sendResponseSafe, sanitizeFileName, deleteFileIfExists methods remain the same) ...
     // Helper to send response via DataOutputStream (use within try-with-resources)
     private void sendResponse(DataOutputStream dos, String status) {
         try {
             dos.writeUTF(status);
             dos.flush();
-            logger.debug("Sent status '{}' to client {}", status, clientSocket.getInetAddress().getHostAddress());
+            logger.debug("[{}] Sent status '{}'.", clientSocket.getInetAddress().getHostAddress(), status);
         } catch (IOException e) {
-            logger.warn("Failed to send status '{}' to client {}: {}", status, clientSocket.getInetAddress().getHostAddress(), e.getMessage());
+            logger.warn("[{}] Failed to send status '{}': {}", clientSocket.getInetAddress().getHostAddress(), status, e.getMessage());
         }
     }
 
@@ -189,13 +238,14 @@ public class VideoConsumer implements Runnable {
     private void sendResponseSafe(Socket socket, String status) {
         try {
             if (socket != null && !socket.isClosed() && socket.isConnected()) {
+                // No guarantee getOutputStream won't throw exception here, but worth trying
                 DataOutputStream dos = new DataOutputStream(socket.getOutputStream());
                 dos.writeUTF(status);
                 dos.flush();
-                logger.debug("Sent status '{}' to client {} (safe mode)", status, socket.getInetAddress().getHostAddress());
+                logger.debug("[{}] Sent status '{}' (safe mode).", socket.getInetAddress().getHostAddress(), status);
             }
         } catch (IOException e) {
-            logger.warn("Failed to send status '{}' to client {} (safe mode): {}", status, socket.getInetAddress().getHostAddress(), e.getMessage());
+            logger.warn("[{}] Failed to send status '{}' (safe mode): {}", socket.getInetAddress().getHostAddress(), status, e.getMessage());
         }
     }
 
@@ -204,18 +254,27 @@ public class VideoConsumer implements Runnable {
         if (fileName == null) return "unknown_file";
         // Remove path components, allow alphanumeric, dots, underscores, hyphens
         String nameOnly = new File(fileName).getName();
-        return nameOnly.replaceAll("[^a-zA-Z0-9.\\-_]+", "_");
+        // Replace sequences of problematic chars with single underscore
+        return nameOnly.replaceAll("[^a-zA-Z0-9.\\-_]+", "_").replaceAll("_+", "_");
     }
 
     // Helper to delete a file and log outcome
     private void deleteFileIfExists(Path path, String reason) {
         if (path != null) {
             try {
-                if (Files.deleteIfExists(path)) {
-                    logger.info("Deleted temporary file '{}' due to: {}", path.getFileName(), reason);
+                // Check existence again before deleting, as another thread might have acted
+                if (Files.exists(path)) {
+                    if (Files.deleteIfExists(path)) {
+                        logger.info("[{}] Deleted file '{}' due to: {}", clientSocket.getInetAddress().getHostAddress(), path.getFileName(), reason);
+                    } else {
+                        logger.warn("[{}] Attempted to delete file '{}' but deleteIfExists returned false (reason: {}).", clientSocket.getInetAddress().getHostAddress(), path.getFileName(), reason);
+                    }
+                } else {
+                    // Log if we intended to delete but it was already gone (might be expected)
+                    logger.trace("[{}] Intended to delete file '{}' ({}), but it did not exist.", clientSocket.getInetAddress().getHostAddress(), path.getFileName(), reason);
                 }
             } catch (IOException e) {
-                logger.warn("Failed to delete temporary file '{}' during {}: {}", path.getFileName(), reason, e.getMessage());
+                logger.warn("[{}] Failed during deletion check/attempt for file '{}' ({}): {}", clientSocket.getInetAddress().getHostAddress(), path.getFileName(), reason, e.getMessage());
             }
         }
     }
