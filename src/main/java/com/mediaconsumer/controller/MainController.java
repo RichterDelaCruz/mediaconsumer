@@ -37,7 +37,7 @@ public class MainController {
     // --- REMOVED TEMPORARY TEST DELAY ---
     // private static final long QUEUE_CONSUME_DELAY_MS = 1000; // Delay was here
     // --- END REMOVED TEMPORARY TEST DELAY ---
-    private static final long QUEUE_CONSUME_DELAY_MS = 30000; // e.g., 10 second delay
+    private static final long QUEUE_CONSUME_DELAY_MS = 0; // e.g., 10s second delay
 
     @FXML private ScrollPane scrollPane;
     @FXML private TilePane videoTilePane;
